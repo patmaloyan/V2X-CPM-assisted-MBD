@@ -14,6 +14,69 @@ from mdm_lib import MDMLib
 import pandas as pd
 
 
+class CatchMLPDecision:
+    """Minimal feed-forward scorer for CATCH check vectors."""
+
+    DEFAULT_FEATURES = (
+        'range_plausibility',
+        'position_plausibility_check',
+        'speed_plausibility_check',
+        'position_consistency_check',
+        'speed_consistency_check',
+        'position_speed_consistency_check',
+        'position_heading_consistency_check',
+        'intersection_check',
+    )
+
+    def __init__(self, layers, threshold: float = 0.5, feature_names=None):
+        self.layers = layers
+        self.threshold = float(threshold)
+        self.feature_names = tuple(feature_names) if feature_names else self.DEFAULT_FEATURES
+
+    @staticmethod
+    def from_file(model_path: str):
+        with open(model_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        layers = data.get('layers')
+        if not layers:
+            raise ValueError('MLP model file must contain a non-empty "layers" list')
+
+        return CatchMLPDecision(
+            layers=layers,
+            threshold=data.get('threshold', 0.5),
+            feature_names=data.get('feature_names')
+        )
+
+    def _prepare_input(self, features):
+        if isinstance(features, dict):
+            return np.array([
+                float(np.clip(features.get(name, 0.0), 0.0, 1.0))
+                for name in self.feature_names
+            ], dtype=np.float64)
+
+        vector = np.asarray(features, dtype=np.float64)
+        return np.clip(vector, 0.0, 1.0)
+
+    def predict_score(self, features) -> float:
+        activation = self._prepare_input(features)
+
+        for layer_index, layer in enumerate(self.layers):
+            weights = np.asarray(layer['weights'], dtype=np.float64)
+            bias = np.asarray(layer['bias'], dtype=np.float64)
+            activation = activation @ weights.T + bias
+
+            if layer_index < len(self.layers) - 1:
+                activation = np.maximum(activation, 0.0)
+            else:
+                activation = 1.0 / (1.0 + np.exp(-activation))
+
+        return float(np.squeeze(activation))
+
+    def predict(self, features) -> int:
+        return 1 if self.predict_score(features) >= self.threshold else 0
+
+
 def save_messages(results: pd.DataFrame, input_file: Path, source_file):
     output_dir = input_file.parent / "output"
     output_dir.mkdir(exist_ok=True)
@@ -25,24 +88,91 @@ def save_messages(results: pd.DataFrame, input_file: Path, source_file):
         json.dump(nested_data, f, indent=4)
 
 
-def calculate_metrics(results: pd.DataFrame) -> dict:
-    tp = ((results['attacker'] == 1) & (results['prediction'] == 1)).sum()
-
-    tn = ((results['attacker'] == 0) & (results['prediction'] == 0)).sum()
-
-    fp = ((results['attacker'] == 0) & (results['prediction'] == 1)).sum()
-
-    fn = ((results['attacker'] == 1) & (results['prediction'] == 0)).sum()
+def calculate_metrics(results: pd.DataFrame, prediction_column: str = 'prediction', suffix: str = '') -> dict:
+    tp = ((results['attacker'] == 1) & (results[prediction_column] == 1)).sum()
+    tn = ((results['attacker'] == 0) & (results[prediction_column] == 0)).sum()
+    fp = ((results['attacker'] == 0) & (results[prediction_column] == 1)).sum()
+    fn = ((results['attacker'] == 1) & (results[prediction_column] == 0)).sum()
 
     return {
-        'tp': int(tp),
-        'tn': int(tn),
-        'fp': int(fp),
-        'fn': int(fn)
+        f'tp{suffix}': int(tp),
+        f'tn{suffix}': int(tn),
+        f'fp{suffix}': int(fp),
+        f'fn{suffix}': int(fn)
     }
 
 
-def perform_catch_checks(messages: pd.DataFrame, checks: CatchChecks) -> pd.DataFrame:
+def prepare_messages_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize raw rows into the flat layout expected by the CaTCH checks."""
+    df = df.copy()
+
+    df['rcvTime'] = df['rcvTime'].astype(int)
+    df['sendTime'] = df['sendTime'].astype(int)
+    df['sender_id'] = df['sender_id'].astype(str)
+    df['sender_alias'] = df['sender_alias'].astype(int)
+    df['messageID'] = df['messageID'].astype(int)
+    df['attacker'] = df['attacker'].astype(int)
+
+    df['receiver_spd'] = df['receiver_spd'].astype(np.float64)
+    df['receiver_spd_noise'] = df['receiver_spd_noise'].astype(np.float64)
+    df['receiver_acl'] = df['receiver_acl'].astype(float)
+    df['receiver_acl_noise'] = df['receiver_acl_noise'].astype(float)
+    df['receiver_hed'] = df['receiver_hed'].astype(float)
+    df['receiver_hed_noise'] = df['receiver_hed_noise'].astype(float)
+    df['receiver_driversProfile'] = df['receiver_driversProfile'].astype(str)
+
+    df['sender_spd'] = df['sender_spd'].astype(np.float64)
+    df['sender_spd_noise'] = df['sender_spd_noise'].astype(np.float64)
+    df['sender_acl'] = df['sender_acl'].astype(float)
+    df['sender_acl_noise'] = df['sender_acl_noise'].astype(float)
+    df['sender_hed'] = df['sender_hed'].astype(float)
+    df['sender_hed_noise'] = df['sender_hed_noise'].astype(float)
+    df['sender_driversProfile'] = df['sender_driversProfile'].astype(str)
+    df['sender_distance_to_road_edge'] = df['sender_distance_to_road_edge'].astype(float)
+
+    # The dataset may store coordinates as comma-separated strings or as lists.
+    if isinstance(df.iloc[0].get('sender_pos', '')[0], str):
+        pos_data = df['receiver_pos'].str.split(',', expand=True)
+        df['receiver_pos_lat'] = pos_data[0].astype(np.float64)
+        df['receiver_pos_lon'] = pos_data[1].astype(np.float64)
+        df['receiver_pos_alt'] = pos_data[2].astype(np.float64)
+
+        noise_data = df['receiver_pos_noise'].str.split(',', expand=True)
+        df['receiver_pos_lat_noise'] = noise_data[0].astype(np.float64)
+        df['receiver_pos_lon_noise'] = noise_data[1].astype(np.float64)
+        df['receiver_pos_alt_noise'] = noise_data[2].astype(np.float64)
+
+        sender_pos_data = df['sender_pos'].str.split(',', expand=True)
+        df['sender_pos_lat'] = sender_pos_data[0].astype(np.float64)
+        df['sender_pos_lon'] = sender_pos_data[1].astype(np.float64)
+        df['sender_pos_alt'] = sender_pos_data[2].astype(np.float64)
+
+        sender_noise_data = df['sender_pos_noise'].str.split(',', expand=True)
+        df['sender_pos_lat_noise'] = sender_noise_data[0].astype(np.float64)
+        df['sender_pos_lon_noise'] = sender_noise_data[1].astype(np.float64)
+        df['sender_pos_alt_noise'] = sender_noise_data[2].astype(np.float64)
+    else:
+        df[['receiver_pos_lat', 'receiver_pos_lon', 'receiver_pos_alt']] = pd.DataFrame(
+            df['receiver_pos'].tolist(), index=df.index, columns=['lat', 'lon', 'alt']
+        )
+
+        df[['receiver_pos_lat_noise', 'receiver_pos_lon_noise', 'receiver_pos_alt_noise']] = pd.DataFrame(
+            df['receiver_pos_noise'].tolist(), index=df.index, columns=['lat_noise', 'lon_noise', 'alt_noise']
+        )
+
+        df[['sender_pos_lat', 'sender_pos_lon', 'sender_pos_alt']] = pd.DataFrame(
+            df['sender_pos'].tolist(), index=df.index, columns=['lat', 'lon', 'alt']
+        )
+
+        df[['sender_pos_lat_noise', 'sender_pos_lon_noise', 'sender_pos_alt_noise']] = pd.DataFrame(
+            df['sender_pos_noise'].tolist(), index=df.index, columns=['lat_noise', 'lon_noise', 'alt_noise']
+        )
+
+    return df
+
+
+def perform_catch_checks(messages: pd.DataFrame, checks: CatchChecks,
+                         mlp_model=None, decision_type: str = 'threshold') -> pd.DataFrame:
     history = dict()
     history_data = dict()
 
@@ -144,7 +274,22 @@ def perform_catch_checks(messages: pd.DataFrame, checks: CatchChecks) -> pd.Data
         history_data[msg.sender_id].append(msg)
         history_data[msg.sender_id] = history_data[msg.sender_id][-10:]
 
-        result['prediction'] = 1 if any(activations.values()) else 0
+        threshold_prediction = 1 if any(activations.values()) else 0
+        result['prediction_threshold'] = threshold_prediction
+        result['prediction'] = threshold_prediction
+
+        if mlp_model is not None:
+            # Keep the MLP input order identical to training.
+            feature_vector = np.array([
+                float(np.clip(prediction_results.get(name, 0.0), 0.0, 1.0))
+                for name in mlp_model.feature_names
+            ], dtype=np.float64)
+            result['prediction_mlp_score'] = mlp_model.predict_score(feature_vector)
+            result['prediction_mlp'] = mlp_model.predict(feature_vector)
+
+            if decision_type == 'mlp':
+                result['prediction'] = result['prediction_mlp']
+
         for check_name, check_value in prediction_results.items():
             result[f'check_{check_name}'] = check_value
 
@@ -264,7 +409,8 @@ def perform_legacy_checks(messages: pd.DataFrame, checks: LegacyChecks) -> pd.Da
     return messages
 
 
-def process(input_file: Path, option: int, params: Parameters, df: pd.DataFrame, source_file):
+def process(input_file: Path, option: int, params: Parameters, df: pd.DataFrame, source_file,
+            mlp_model_path: str = None, decision_type: str = 'threshold'):
     if df.empty:
         with open(input_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -274,74 +420,17 @@ def process(input_file: Path, option: int, params: Parameters, df: pd.DataFrame,
             return
         df = pd.json_normalize(data, sep='_')
 
-    # Metadaten Felder
-    df['rcvTime'] = df['rcvTime'].astype(int)
-    df['sendTime'] = df['sendTime'].astype(int)
-    df['sender_id'] = df['sender_id'].astype(str)
-    df['sender_alias'] = df['sender_alias'].astype(int)
-    df['messageID'] = df['messageID'].astype(int)
-    df['attacker'] = df['attacker'].astype(int)
-    df['prediction'] = 0
-
-    # Receiver Felder
-    df['receiver_spd'] = df['receiver_spd'].astype(np.float64)
-    df['receiver_spd_noise'] = df['receiver_spd_noise'].astype(np.float64)
-    df['receiver_acl'] = df['receiver_acl'].astype(float)
-    df['receiver_acl_noise'] = df['receiver_acl_noise'].astype(float)
-    df['receiver_hed'] = df['receiver_hed'].astype(float)
-    df['receiver_hed_noise'] = df['receiver_hed_noise'].astype(float)
-    df['receiver_driversProfile'] = df['receiver_driversProfile'].astype(str)
-
-    # Sender Felder
-    df['sender_spd'] = df['sender_spd'].astype(np.float64)
-    df['sender_spd_noise'] = df['sender_spd_noise'].astype(np.float64)
-    df['sender_acl'] = df['sender_acl'].astype(float)
-    df['sender_acl_noise'] = df['sender_acl_noise'].astype(float)
-    df['sender_hed'] = df['sender_hed'].astype(float)
-    df['sender_hed_noise'] = df['sender_hed_noise'].astype(float)
-    df['sender_driversProfile'] = df['sender_driversProfile'].astype(str)
-    df['sender_distance_to_road_edge'] = df['sender_distance_to_road_edge'].astype(float)
-
-    if isinstance(df.iloc[0].get('sender_pos', '')[0], str):
-        pos_data = df['receiver_pos'].str.split(',', expand=True)
-        df['receiver_pos_lat'] = pos_data[0].astype(np.float64)
-        df['receiver_pos_lon'] = pos_data[1].astype(np.float64)
-        df['receiver_pos_alt'] = pos_data[2].astype(np.float64)
-
-        noise_data = df['receiver_pos_noise'].str.split(',', expand=True)
-        df['receiver_pos_lat_noise'] = noise_data[0].astype(np.float64)
-        df['receiver_pos_lon_noise'] = noise_data[1].astype(np.float64)
-        df['receiver_pos_alt_noise'] = noise_data[2].astype(np.float64)
-
-        sender_pos_data = df['sender_pos'].str.split(',', expand=True)
-        df['sender_pos_lat'] = sender_pos_data[0].astype(np.float64)
-        df['sender_pos_lon'] = sender_pos_data[1].astype(np.float64)
-        df['sender_pos_alt'] = sender_pos_data[2].astype(np.float64)
-
-        sender_noise_data = df['sender_pos_noise'].str.split(',', expand=True)
-        df['sender_pos_lat_noise'] = sender_noise_data[0].astype(np.float64)
-        df['sender_pos_lon_noise'] = sender_noise_data[1].astype(np.float64)
-        df['sender_pos_alt_noise'] = sender_noise_data[2].astype(np.float64)
-    else:
-        df[['receiver_pos_lat', 'receiver_pos_lon', 'receiver_pos_alt']] = pd.DataFrame(
-            df['receiver_pos'].tolist(), index=df.index, columns=['lat', 'lon', 'alt']
-        )
-
-        df[['receiver_pos_lat_noise', 'receiver_pos_lon_noise', 'receiver_pos_alt_noise']] = pd.DataFrame(
-            df['receiver_pos_noise'].tolist(), index=df.index, columns=['lat_noise', 'lon_noise', 'alt_noise']
-        )
-
-        df[['sender_pos_lat', 'sender_pos_lon', 'sender_pos_alt']] = pd.DataFrame(
-            df['sender_pos'].tolist(), index=df.index, columns=['lat', 'lon', 'alt']
-        )
-
-        df[['sender_pos_lat_noise', 'sender_pos_lon_noise', 'sender_pos_alt_noise']] = pd.DataFrame(
-            df['sender_pos_noise'].tolist(), index=df.index, columns=['lat_noise', 'lon_noise', 'alt_noise']
-        )
+    df = prepare_messages_dataframe(df)
 
     if option == 0:
         checks = CatchChecks(params)
-        results = perform_catch_checks(df, checks)
+        mlp_model = None
+        if decision_type in ('mlp', 'both'):
+            if mlp_model_path is None:
+                raise ValueError(f"decision_type='{decision_type}' requires --mlp_model")
+            mlp_model = CatchMLPDecision.from_file(mlp_model_path)
+
+        results = perform_catch_checks(df, checks, mlp_model=mlp_model, decision_type=decision_type)
     elif option == 1:
         checks = LegacyChecks(params)
         results = perform_legacy_checks(df, checks)
@@ -350,4 +439,9 @@ def process(input_file: Path, option: int, params: Parameters, df: pd.DataFrame,
 
     #save_messages(results, input_file, source_file)
 
-    return calculate_metrics(results)
+    metrics = calculate_metrics(results, 'prediction_threshold', '') if 'prediction_threshold' in results.columns else calculate_metrics(results)
+
+    if 'prediction_mlp' in results.columns:
+        metrics.update(calculate_metrics(results, 'prediction_mlp', '_mlp'))
+
+    return metrics
