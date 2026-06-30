@@ -10,6 +10,23 @@ from pathlib import Path
 
 ATTACK_RATIO = 0.2
 
+# CPM-addition: sender fields copied from attacked CAMs into attacker CPM sender blocks.
+SENDER_STATE_FIELDS = [
+    'sender_pos_lat',
+    'sender_pos_lon',
+    'sender_pos_alt',
+    'sender_pos_lat_noise',
+    'sender_pos_lon_noise',
+    'sender_pos_alt_noise',
+    'sender_spd',
+    'sender_spd_noise',
+    'sender_acl',
+    'sender_acl_noise',
+    'sender_hed',
+    'sender_hed_noise',
+    'sender_driversProfile',
+]
+
 parser = argparse.ArgumentParser(description="Sort a JSON array by sendTime.")
 parser.add_argument("input_folder", help="Path to the input files")
 parser.add_argument("misbehavior", help="Specify the misbehavior")
@@ -84,6 +101,7 @@ def random_float_with_intervals(pos_min, pos_max, neg_min, neg_max):
 
 def reconstruct_nested(row):
     return {
+        'type': row.get('type', 'CAM'),
         'rcvTime': row['rcvTime'],
         'sendTime': row['sendTime'],
         'sender_id': row['sender_id'],
@@ -113,6 +131,26 @@ def reconstruct_nested(row):
             'driversProfile': row['sender_driversProfile']
         }
     }
+
+
+def reconstruct_cpm_nested(row):
+    # CPM-addition: preserve CPM perceived objects when reconstructing output.
+    msg = reconstruct_nested(row)
+    msg['type'] = row.get('type', 'CPM')
+    msg['perceivedObjects'] = row.get('perceivedObjects', [])
+    return msg
+
+
+def normalize_message_id(message_id, message_type):
+    message_id = str(message_id)
+    prefix = f"{message_type.lower()}_"
+    if message_id.startswith(prefix):
+        return message_id
+    return f"{prefix}{message_id}"
+
+
+def make_derived_message_id(message_id, suffix):
+    return f"{message_id}_{suffix}"
 
 
 def get_distance_to_nearest_road(x: float, y: float, x_with_error: float, y_with_error: float) -> float:
@@ -383,7 +421,7 @@ def dos_attack(msg: pd.Series):
     u_values = np.arange(1, amount)
     new_sendTimes = msg['sendTime'] + frequency * u_values
     new_rcvTimes = msg['rcvTime'] + frequency * u_values
-    new_messageIDs = msg['messageID'] + i_values
+    new_messageIDs = [make_derived_message_id(msg['messageID'], int(i)) for i in i_values]
     new_data = []
     for i, (sendTime, rcvTime, messageID) in enumerate(zip(new_sendTimes, new_rcvTimes, new_messageIDs)):
         new_row = msg.copy()
@@ -408,7 +446,7 @@ def traffic_congestion_sybil(msg: pd.Series):
         i_values = np.arange(2000000, 2000000 + amount)
         new_sendTimes = msg['sendTime'] + frequency * i_values
         new_rcvTimes = msg['rcvTime'] + frequency * i_values
-        new_messageIDs = msg['messageID'] + i_values
+        new_messageIDs = [make_derived_message_id(msg['messageID'], int(i)) for i in i_values]
 
         new_data = []
         for i, (sendTime, rcvTime, messageID) in enumerate(zip(new_sendTimes, new_rcvTimes, new_messageIDs)):
@@ -580,22 +618,9 @@ def assign_misbehaviors_to_attackers(attacker_ids, misbehavior_list):
     return assignments
 
 
-def process_single_file(json_file):
-    global df
-    global misbehavior_config
-    global df_attack
-    global attackerIDs
-    global messages_lookup
-    global sender_lookup
-
-    with open(json_file, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-
-    if len(data) < 1:
-        print(f"File {json_file} is empty, skipping...")
-        return
-
+def prepare_message_dataframe(data, message_type):
     df = pd.json_normalize(data, sep='_')
+    df['type'] = message_type
     df['attacker'] = 0
 
     # Metadata fields
@@ -603,7 +628,7 @@ def process_single_file(json_file):
     df['sendTime'] = df['sendTime'].astype(int)
     df['sender_id'] = df['sender_id'].astype(str)
     df['sender_alias'] = df['sender_alias'].astype(int)
-    df['messageID'] = df['messageID'].astype(int)
+    df['messageID'] = df['messageID'].apply(lambda value: normalize_message_id(value, message_type))
 
     # Receiver fields
     df['receiver_pos'] = df['receiver_pos'].astype(str)
@@ -638,6 +663,27 @@ def process_single_file(json_file):
     df[['sender_pos_lat_noise', 'sender_pos_lon_noise', 'sender_pos_alt_noise']] = df['sender_pos_noise'].str.split(',',
                                                                                                                     expand=True).astype(
         float)
+
+    return df
+
+
+def process_single_file(json_file):
+    global df
+    global misbehavior_config
+    global df_attack
+    global attackerIDs
+    global messages_lookup
+    global sender_lookup
+    global attacked_cam_timeline
+
+    with open(json_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    if len(data) < 1:
+        print(f"File {json_file} is empty, skipping...")
+        return
+
+    df = prepare_message_dataframe(data, 'CAM')
 
     df.sort_values(by='rcvTime', ascending=True, inplace=True)
 
@@ -699,11 +745,71 @@ def process_single_file(json_file):
 
     df.sort_values(by='rcvTime', ascending=True, inplace=True)
 
+    for sender_id, sender_df in df.groupby('sender_id'):
+        # CPM-addition: keep attacked CAM history for later CPM sender synchronization.
+        sender_timeline = sender_df.sort_values(by='sendTime').copy()
+        if sender_id in attacked_cam_timeline:
+            attacked_cam_timeline[sender_id] = pd.concat(
+                [attacked_cam_timeline[sender_id], sender_timeline], ignore_index=True
+            ).sort_values(by='sendTime')
+        else:
+            attacked_cam_timeline[sender_id] = sender_timeline
+
     # Convert back to nested structure
     nested_data = df.apply(reconstruct_nested, axis=1).tolist()
 
     # Save
-    output_file = input_folder.parent / f"{input_folder.name}_{args.misbehavior}" / f"{json_file.name}"
+    output_file = cam_output_dir / f"{json_file.name}"
+    with open(output_file, 'w') as f:
+        json.dump(nested_data, f, indent=4)
+
+
+def find_latest_prior_attacked_cam(sender_id, send_time):
+    # CPM-addition: use latest prior CAM to avoid copying future sender state into CPM.
+    sender_timeline = attacked_cam_timeline.get(sender_id)
+    if sender_timeline is None or sender_timeline.empty:
+        return None
+
+    prior_messages = sender_timeline[sender_timeline['sendTime'] <= send_time]
+    if prior_messages.empty:
+        return None
+
+    return prior_messages.iloc[-1]
+
+
+def sync_cpm_sender_with_attacked_cam(row):
+    if row['sender_id'] not in attackerIDs:
+        return row
+
+    cam_row = find_latest_prior_attacked_cam(row['sender_id'], row['sendTime'])
+    if cam_row is None:
+        return row
+
+    for field in SENDER_STATE_FIELDS:
+        row[field] = cam_row[field]
+
+    row['attacker'] = cam_row['attacker']
+    return row
+
+
+def process_cpm_file(json_file):
+    # CPM-addition: update attacker CPM sender state while keeping receiver/perceivedObjects intact.
+    with open(json_file, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    if len(data) < 1:
+        print(f"File {json_file} is empty, skipping...")
+        return
+
+    df_cpm = prepare_message_dataframe(data, 'CPM')
+    df_cpm['perceivedObjects'] = [msg.get('perceivedObjects', []) for msg in data]
+    df_cpm.sort_values(by='rcvTime', ascending=True, inplace=True)
+    df_cpm = df_cpm.apply(sync_cpm_sender_with_attacked_cam, axis=1)
+    df_cpm.sort_values(by='rcvTime', ascending=True, inplace=True)
+
+    nested_data = df_cpm.apply(reconstruct_cpm_nested, axis=1).tolist()
+
+    output_file = output_dir / 'cpm' / f"{json_file.name}"
     with open(output_file, 'w') as f:
         json.dump(nested_data, f, indent=4)
 
@@ -811,14 +917,26 @@ if __name__ == "__main__":
     messages_lookup = {}
     sender_lookup = {}
     misbehavior_config['ratio'] = ATTACK_RATIO
+    attacked_cam_timeline = {}
     output_dir = input_folder.parent / f"{input_folder.name}_{args.misbehavior}"
+    # CPM-addition: support datasets split into cam/ and cpm/ folders.
+    cam_input_dir = input_folder / 'cam' if (input_folder / 'cam').is_dir() else input_folder
+    cpm_input_dir = input_folder / 'cpm' if (input_folder / 'cpm').is_dir() else None
+    cam_output_dir = output_dir / 'cam' if cpm_input_dir is not None else output_dir
     output_dir.mkdir(exist_ok=True)
+    cam_output_dir.mkdir(exist_ok=True)
+    if cpm_input_dir is not None:
+        (output_dir / 'cpm').mkdir(exist_ok=True)
 
-    for json_file in input_folder.glob('*.json'):
+    for json_file in cam_input_dir.glob('*.json'):
         with open(json_file, 'r') as f:
             data = json.load(f)
             df_temp = pd.json_normalize(data, sep='_')
             df_all = pd.concat([df_all, df_temp], ignore_index=True)
+    if df_all.empty:
+        raise ValueError(f"No CAM JSON files found in {cam_input_dir}")
+
+    df_all['messageID'] = df_all['messageID'].apply(lambda value: normalize_message_id(value, 'CAM'))
     df_all = df_all.drop_duplicates(subset='messageID')
 
     df_all['attacker'] = 0
@@ -828,7 +946,6 @@ if __name__ == "__main__":
     df_all['sendTime'] = df_all['sendTime'].astype(int)
     df_all['sender_id'] = df_all['sender_id'].astype(str)
     df_all['sender_alias'] = df_all['sender_alias'].astype(int)
-    df_all['messageID'] = df_all['messageID'].astype(int)
 
     # Receiver Felder
     df_all['receiver_pos'] = df_all['receiver_pos'].astype(str)
@@ -913,17 +1030,24 @@ if __name__ == "__main__":
     if needs_sumo:
         start_sumo()
 
-    files_to_process = [f for f in input_folder.glob('*.json')
+    files_to_process = [f for f in cam_input_dir.glob('*.json')
                         if not f.stem.endswith(tuple(misbehaviorOptions))]
 
     total_files = len(files_to_process)
     count = 0
 
-    for json_file in input_folder.glob('*.json'):
+    for json_file in cam_input_dir.glob('*.json'):
         if not json_file.stem.endswith(tuple(misbehaviorOptions)):
             process_single_file(json_file)
             count += 1
             print(f"Processing misbehavior for file {count}/{total_files}: {json_file.name}")
+
+    if cpm_input_dir is not None:
+        cpm_files_to_process = [f for f in cpm_input_dir.glob('*.json')
+                                if not f.stem.endswith(tuple(misbehaviorOptions))]
+        for index, json_file in enumerate(cpm_files_to_process, start=1):
+            process_cpm_file(json_file)
+            print(f"Processing CPM consistency for file {index}/{len(cpm_files_to_process)}: {json_file.name}")
 
     if needs_sumo:
         stop_sumo()

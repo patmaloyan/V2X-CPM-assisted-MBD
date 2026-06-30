@@ -17,6 +17,8 @@ package etsi;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import entities.CpmPayload;
 import entities.DriverProfile;
 import entities.VehicleAdditionalInformation;
 import org.eclipse.mosaic.fed.application.ambassador.simulation.communication.CamBuilder;
@@ -26,8 +28,12 @@ import org.eclipse.mosaic.fed.application.ambassador.simulation.perception.Simpl
 import org.eclipse.mosaic.fed.application.ambassador.simulation.perception.index.objects.VehicleObject;
 import org.eclipse.mosaic.fed.application.app.api.os.VehicleOperatingSystem;
 import org.eclipse.mosaic.interactions.communication.V2xMessageTransmission;
+import org.eclipse.mosaic.lib.enums.AdHocChannel;
 import org.eclipse.mosaic.lib.geo.CartesianPoint;
 import org.eclipse.mosaic.lib.geo.MutableCartesianPoint;
+import org.eclipse.mosaic.lib.objects.ToDataOutput;
+import org.eclipse.mosaic.lib.objects.v2x.GenericV2xMessage;
+import org.eclipse.mosaic.lib.objects.v2x.MessageRouting;
 import org.eclipse.mosaic.lib.objects.v2x.V2xMessage;
 import org.eclipse.mosaic.lib.objects.v2x.etsi.Cam;
 import org.eclipse.mosaic.lib.objects.v2x.etsi.cam.VehicleAwarenessData;
@@ -40,6 +46,8 @@ import util.SerializationUtils;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -51,10 +59,10 @@ import java.util.Random;
  */
 public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperatingSystem> {
 
-    // Front sensor setup from the collective perception misbehavior framework.
+    // Front sensor setup used to collect perceived objects for CPMs.
     private static final double VIEWING_ANGLE = 60d;
     private static final double VIEWING_RANGE = 80d;
-    // CPM-like records are sampled once per second, using MOSAIC simulation time in nanoseconds.
+    // Send CPMs once per second, using MOSAIC simulation time in nanoseconds.
     private static final long CPM_INTERVAL = 1_000_000_000L;
 
     JSONParser jsonParser = new JSONParser();
@@ -83,7 +91,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         getLog().debugSimTime(this, "Initialize application");
         activateCommunicationModule();
 
-        // Enable MOSAIC perception so this vehicle can later generate CPM-like perceived objects.
+        // CPM addition: enable MOSAIC perception so this vehicle can populate perceivedObjects.
         getOs().getPerceptionModule().enable(
                 new SimplePerceptionConfiguration.Builder(VIEWING_ANGLE, VIEWING_RANGE).build()
         );
@@ -108,39 +116,60 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         firstSample();
     }
 
-    // Schedule the next 1 Hz CPM sampling event for this sender vehicle.
+    // Schedule the next 1 Hz CPM generation event for this sender vehicle.
     private void scheduleNextCpmEvent() {
-        // CPM generation is independent of CAM receive events.
+        // CPM generation is independent of CAM generation and receive events.
         getOperatingSystem().getEventManager().addEvent(
                 getOperatingSystem().getSimulationTime() + CPM_INTERVAL, this::generateCpm
         );
     }
 
-    // Run one CPM sampling tick and reschedule the following tick.
+    // Run one CPM send tick and reschedule the following tick.
     private void generateCpm(Event event) {
         if (!canProcessEvent()) {
             return;
         }
 
         if (isInSimulationTime() && isInSimulationArea()) {
-            writeCpmJson();
+            sendCpm();
         }
 
         scheduleNextCpmEvent();
     }
 
-    // Build and append one CPM-like JSON record for the current vehicle.
-    private void writeCpmJson() {
+    private void sendCpm() {
+        JsonObject cpmJson = buildCpmJson();
+        if (cpmJson == null) {
+            return;
+        }
+
+        // Send CPM as a real MOSAIC ad-hoc V2X message on the CCH.
+        MessageRouting routing = getOperatingSystem().getAdHocModule().createMessageRouting()
+                .channel(AdHocChannel.CCH)
+                .broadcast()
+                .topological()
+                .singlehop()
+                .build();
+
+        GenericV2xMessage cpmMessage = new GenericV2xMessage(
+                routing,
+                new CpmPayload(cpmJson.toString()),
+                getConfiguration().minimalPayloadLength
+        );
+        getOperatingSystem().getAdHocModule().sendV2xMessage(cpmMessage);
+    }
+
+    // Build one sender-side CPM JSON payload for transmission.
+    private JsonObject buildCpmJson() {
         Data senderData = generateEtsiData();
         if (senderData == null) {
             getLog().debugSimTime(this, "Skipping CPM JSON because sender vehicle data is unavailable.");
-            return;
+            return null;
         }
 
         List<VehicleObject> perceivedVehicles = getOs().getPerceptionModule().getPerceivedVehicles();
         getLog().infoSimTime(this, "CPM perceived vehicles count: {}", perceivedVehicles.size());
 
-        // Store sender state and MOSAIC-perceived vehicles in a separate CPM-like JSON stream.
         JsonObject cpmJson = new JsonObject();
         cpmJson.addProperty("type", "CPM");
         cpmJson.addProperty("sendTime", senderData.time);
@@ -150,17 +179,10 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         cpmJson.add("sender", createSenderJson(senderData));
         cpmJson.add("perceivedObjects", createPerceivedObjectsJson(senderData.cartesianPoint, perceivedVehicles));
 
-        File cpmDirectory = new File(getConfiguration().jsonPath, "cpm");
-        if (!cpmDirectory.exists() && !cpmDirectory.mkdirs()) {
-            getLog().infoSimTime(this, "Could not create CPM output directory: {}", cpmDirectory.getAbsolutePath());
-            return;
-        }
-
-        File cpmFile = new File(cpmDirectory, getOs().getId() + ".json");
-        jsonParser.parseAndWriteJson(cpmJson.toString(), cpmFile.getPath());
+        return cpmJson;
     }
 
-    // Capture the CPM sender state in the same compact field style as the CAM JSON.
+    // Capture sender state in the same compact field style as the CAM JSON.
     private JsonObject createSenderJson(Data senderData) {
         JsonObject senderJson = new JsonObject();
         senderJson.addProperty("pos", formatCartesianPoint(senderData.cartesianPoint));
@@ -175,7 +197,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         return senderJson;
     }
 
-    // Convert MOSAIC perceived vehicles into CPM-like perceived object records.
+    // Convert MOSAIC perceived vehicles into CPM perceived object records.
     private JsonArray createPerceivedObjectsJson(CartesianPoint senderPosition, List<VehicleObject> perceivedVehicles) {
         JsonArray perceivedObjectsJson = new JsonArray();
 
@@ -205,7 +227,7 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         return point.getX() + "," + point.getY() + "," + point.getZ();
     }
 
-    // CPM objects carry relative position from sender to perceived object.
+    // Perceived objects carry relative position from sender to object.
     private String formatRelativePosition(CartesianPoint senderPosition, CartesianPoint objectPosition) {
         if (senderPosition == null || objectPosition == null) {
             return "";
@@ -340,11 +362,30 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         getLog().infoSimTime(this, "Received V2X Message:", receivedV2xMessage);
         try {
             if(isInSimulationArea()) {
-                jsonParser.parseAndWriteJson(createJSONString(receivedV2xMessage), getConfiguration().jsonPath + getOs().getId() + ".json");
+                jsonParser.parseAndWriteJson(createJSONString(receivedV2xMessage), getReceivedJsonPath(receivedV2xMessage));
             }
         } catch (Exception e) {
-            getLog().infoSimTime(this, "Error while parsing json");
+            getLog().infoSimTime(this, "Error while parsing json: {}", e.toString());
         }
+    }
+
+    private String getReceivedJsonPath(ReceivedV2xMessage receivedV2xMessage) {
+        String messageFolder = "unknown";
+        V2xMessage v2xMessage = receivedV2xMessage.getMessage();
+
+        // CPM addition: keep received CAM and CPM datasets in separate output folders.
+        if (v2xMessage instanceof Cam) {
+            messageFolder = "cam";
+        } else if (v2xMessage instanceof GenericV2xMessage) {
+            messageFolder = "cpm";
+        }
+
+        File outputDirectory = new File(getConfiguration().jsonPath, messageFolder);
+        if (!outputDirectory.exists() && !outputDirectory.mkdirs()) {
+            getLog().infoSimTime(this, "Could not create JSON output directory: {}", outputDirectory.getAbsolutePath());
+        }
+
+        return new File(outputDirectory, getOs().getId() + ".json").getPath();
     }
 
     public String createJSONString(ReceivedV2xMessage receivedV2xMessage) throws IOException, ClassNotFoundException {
@@ -387,21 +428,63 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
                         + "}";
 
                 return "{"
+                        + "\"type\":\"CAM\","
                         + "\"rcvTime\":\"" + receivedV2xMessage.getReceiverInformation().getReceiveTime() + "\","
                         + "\"sendTime\":\"" + cam.getGenerationTime() + "\","
                         + "\"sender_id\":\"" + cam.getRouting().getSource().getSourceName() + "\","
                         + "\"sender_alias\":\"" + vehicleAdditionalInformation.alias + "\","
-                        + "\"messageID\":\"" + cam.getId() + "\","
+                        + "\"messageID\":\"cam_" + cam.getId() + "\","
                         + "\"receiver\":" + receiverJSON + ","
                         + "\"sender\":" + senderJson
                         + "}";
             }
-            return "{\"rcvTime\":\"" + LocalDateTime.now() + "\"," +
+            return "{\"type\":\"CAM\"," +
+                    "\"rcvTime\":\"" + LocalDateTime.now() + "\"," +
                     "\"sendTime\":\"" + cam.getGenerationTime() + "\"," +
                     "\"sender\":\"" + cam.getRouting().getSource().getSourceName() + "\"," +
-                    "\"messageID\":\"" + cam.getId() + "\"}";
+                    "\"messageID\":\"cam_" + cam.getId() + "\"}";
+        }
+        if (v2xMessage instanceof GenericV2xMessage genericV2xMessage) {
+            // Decode CPM payload, add receiver-side fields, then write like CAM.
+            JsonObject cpmJson = JsonParser.parseString(decodeCpmPayloadJson(genericV2xMessage)).getAsJsonObject();
+            cpmJson.addProperty("rcvTime", receivedV2xMessage.getReceiverInformation().getReceiveTime());
+            cpmJson.add("receiver", createReceiverJson(receiverData));
+            return cpmJson.toString();
         }
         return "{\"rcvTime\":\"" + LocalDateTime.now() + "\"}";
+    }
+
+    private String decodeCpmPayloadJson(GenericV2xMessage genericV2xMessage) {
+        // Decode raw payload bytes directly for stable custom CPM JSON handling.
+        byte[] payloadBytes = genericV2xMessage.getPayload().getBytes();
+        if (payloadBytes.length < Integer.BYTES) {
+            return "{}";
+        }
+
+        ByteBuffer payloadBuffer = ByteBuffer.wrap(payloadBytes);
+        int jsonLength = payloadBuffer.getInt();
+        if (jsonLength < 0 || jsonLength > payloadBuffer.remaining()) {
+            return "{}";
+        }
+
+        byte[] jsonBytes = new byte[jsonLength];
+        payloadBuffer.get(jsonBytes);
+        return new String(jsonBytes, StandardCharsets.UTF_8);
+    }
+
+    private JsonObject createReceiverJson(Data receiverData) {
+        // Receiver state is appended only after MOSAIC delivers the CPM.
+        JsonObject receiverJson = new JsonObject();
+        receiverJson.addProperty("pos", formatCartesianPoint(receiverData.cartesianPoint));
+        receiverJson.addProperty("pos_noise", formatCartesianPoint(receiverData.positionNoise));
+        receiverJson.addProperty("spd", receiverData.velocity);
+        receiverJson.addProperty("spd_noise", receiverData.speedNoise);
+        receiverJson.addProperty("acl", receiverData.acceleration);
+        receiverJson.addProperty("acl_noise", receiverData.accelerationNoise);
+        receiverJson.addProperty("hed", receiverData.heading);
+        receiverJson.addProperty("hed_noise", receiverData.headingNoise);
+        receiverJson.addProperty("driversProfile", receiverData.speedMode.toString());
+        return receiverJson;
     }
 
     public boolean isInSimulationArea() {
