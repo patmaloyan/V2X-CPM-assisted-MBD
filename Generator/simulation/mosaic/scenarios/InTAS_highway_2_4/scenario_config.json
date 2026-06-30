@@ -1,7 +1,7 @@
 {
     "simulation": {
         "id": "InTAS",
-        "duration": "24h",
+        "duration": "60s",
         "randomSeed": 268965854,
         "projection": {
             "centerCoordinates": {

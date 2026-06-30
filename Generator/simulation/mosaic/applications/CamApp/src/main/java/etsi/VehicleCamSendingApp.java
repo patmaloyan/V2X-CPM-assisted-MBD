@@ -15,11 +15,15 @@
 
 package etsi;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import entities.DriverProfile;
 import entities.VehicleAdditionalInformation;
 import org.eclipse.mosaic.fed.application.ambassador.simulation.communication.CamBuilder;
 import org.eclipse.mosaic.fed.application.ambassador.simulation.communication.ReceivedAcknowledgement;
 import org.eclipse.mosaic.fed.application.ambassador.simulation.communication.ReceivedV2xMessage;
+import org.eclipse.mosaic.fed.application.ambassador.simulation.perception.SimplePerceptionConfiguration;
+import org.eclipse.mosaic.fed.application.ambassador.simulation.perception.index.objects.VehicleObject;
 import org.eclipse.mosaic.fed.application.app.api.os.VehicleOperatingSystem;
 import org.eclipse.mosaic.interactions.communication.V2xMessageTransmission;
 import org.eclipse.mosaic.lib.geo.CartesianPoint;
@@ -28,14 +32,17 @@ import org.eclipse.mosaic.lib.objects.v2x.V2xMessage;
 import org.eclipse.mosaic.lib.objects.v2x.etsi.Cam;
 import org.eclipse.mosaic.lib.objects.v2x.etsi.cam.VehicleAwarenessData;
 import org.eclipse.mosaic.lib.objects.vehicle.VehicleData;
+import org.eclipse.mosaic.lib.util.scheduling.Event;
 import util.JSONParser;
 import util.Pair;
 import util.SensorErrorModel;
 import util.SerializationUtils;
 
+import java.io.File;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Objects;
 import java.util.Random;
 
@@ -43,6 +50,12 @@ import java.util.Random;
  * ETSI conform application for vehicles.
  */
 public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperatingSystem> {
+
+    // Front sensor setup from the collective perception misbehavior framework.
+    private static final double VIEWING_ANGLE = 60d;
+    private static final double VIEWING_RANGE = 80d;
+    // CPM-like records are sampled once per second, using MOSAIC simulation time in nanoseconds.
+    private static final long CPM_INTERVAL = 1_000_000_000L;
 
     JSONParser jsonParser = new JSONParser();
     SerializationUtils serializationUtils = new SerializationUtils();
@@ -63,12 +76,20 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
     private Pair<Double, Double> postProcessingSpeed;
     private Pair<Double, Double> postProcessingAcceleration;
     private Pair<Double, Double> postProcessingHeading;
+    private long cpmMessageCounter = 0;
 
     @Override
     public void onStartup() {
         getLog().debugSimTime(this, "Initialize application");
         activateCommunicationModule();
 
+        // Enable MOSAIC perception so this vehicle can later generate CPM-like perceived objects.
+        getOs().getPerceptionModule().enable(
+                new SimplePerceptionConfiguration.Builder(VIEWING_ANGLE, VIEWING_RANGE).build()
+        );
+        getLog().infoSimTime(this, "Perception enabled with angle {} deg and range {} m", VIEWING_ANGLE, VIEWING_RANGE);
+        scheduleNextCpmEvent();
+        
         if (getConfiguration().enableDriverProfiles) {
             Random rand = new Random();
             double randomValue = rand.nextDouble();
@@ -85,6 +106,114 @@ public class VehicleCamSendingApp extends AbstractCamSendingApp<VehicleOperating
         }
 
         firstSample();
+    }
+
+    // Schedule the next 1 Hz CPM sampling event for this sender vehicle.
+    private void scheduleNextCpmEvent() {
+        // CPM generation is independent of CAM receive events.
+        getOperatingSystem().getEventManager().addEvent(
+                getOperatingSystem().getSimulationTime() + CPM_INTERVAL, this::generateCpm
+        );
+    }
+
+    // Run one CPM sampling tick and reschedule the following tick.
+    private void generateCpm(Event event) {
+        if (!canProcessEvent()) {
+            return;
+        }
+
+        if (isInSimulationTime() && isInSimulationArea()) {
+            writeCpmJson();
+        }
+
+        scheduleNextCpmEvent();
+    }
+
+    // Build and append one CPM-like JSON record for the current vehicle.
+    private void writeCpmJson() {
+        Data senderData = generateEtsiData();
+        if (senderData == null) {
+            getLog().debugSimTime(this, "Skipping CPM JSON because sender vehicle data is unavailable.");
+            return;
+        }
+
+        List<VehicleObject> perceivedVehicles = getOs().getPerceptionModule().getPerceivedVehicles();
+        getLog().infoSimTime(this, "CPM perceived vehicles count: {}", perceivedVehicles.size());
+
+        // Store sender state and MOSAIC-perceived vehicles in a separate CPM-like JSON stream.
+        JsonObject cpmJson = new JsonObject();
+        cpmJson.addProperty("type", "CPM");
+        cpmJson.addProperty("sendTime", senderData.time);
+        cpmJson.addProperty("sender_id", getOs().getId());
+        cpmJson.addProperty("sender_alias", senderData.alias);
+        cpmJson.addProperty("messageID", "cpm_" + cpmMessageCounter++);
+        cpmJson.add("sender", createSenderJson(senderData));
+        cpmJson.add("perceivedObjects", createPerceivedObjectsJson(senderData.cartesianPoint, perceivedVehicles));
+
+        File cpmDirectory = new File(getConfiguration().jsonPath, "cpm");
+        if (!cpmDirectory.exists() && !cpmDirectory.mkdirs()) {
+            getLog().infoSimTime(this, "Could not create CPM output directory: {}", cpmDirectory.getAbsolutePath());
+            return;
+        }
+
+        File cpmFile = new File(cpmDirectory, getOs().getId() + ".json");
+        jsonParser.parseAndWriteJson(cpmJson.toString(), cpmFile.getPath());
+    }
+
+    // Capture the CPM sender state in the same compact field style as the CAM JSON.
+    private JsonObject createSenderJson(Data senderData) {
+        JsonObject senderJson = new JsonObject();
+        senderJson.addProperty("pos", formatCartesianPoint(senderData.cartesianPoint));
+        senderJson.addProperty("pos_noise", formatCartesianPoint(senderData.positionNoise));
+        senderJson.addProperty("spd", senderData.velocity);
+        senderJson.addProperty("spd_noise", senderData.speedNoise);
+        senderJson.addProperty("acl", senderData.acceleration);
+        senderJson.addProperty("acl_noise", senderData.accelerationNoise);
+        senderJson.addProperty("hed", senderData.heading);
+        senderJson.addProperty("hed_noise", senderData.headingNoise);
+        senderJson.addProperty("driversProfile", senderData.speedMode.toString());
+        return senderJson;
+    }
+
+    // Convert MOSAIC perceived vehicles into CPM-like perceived object records.
+    private JsonArray createPerceivedObjectsJson(CartesianPoint senderPosition, List<VehicleObject> perceivedVehicles) {
+        JsonArray perceivedObjectsJson = new JsonArray();
+
+        for (VehicleObject perceivedVehicle : perceivedVehicles) {
+            CartesianPoint objectPosition = perceivedVehicle.getProjectedPosition();
+
+            JsonObject objectJson = new JsonObject();
+            objectJson.addProperty("object_id", perceivedVehicle.getId());
+            objectJson.addProperty("global_pos", formatCartesianPoint(objectPosition));
+            objectJson.addProperty("rel_pos", formatRelativePosition(senderPosition, objectPosition));
+            objectJson.addProperty("spd", perceivedVehicle.getSpeed());
+            objectJson.add("acl", null);
+            objectJson.addProperty("hed", perceivedVehicle.getHeading());
+            objectJson.addProperty("dimensions", perceivedVehicle.getLength() + "," + perceivedVehicle.getWidth() + "," + perceivedVehicle.getHeight());
+
+            perceivedObjectsJson.add(objectJson);
+        }
+
+        return perceivedObjectsJson;
+    }
+
+    // Keep position formatting consistent with existing dataset strings.
+    private String formatCartesianPoint(CartesianPoint point) {
+        if (point == null) {
+            return "";
+        }
+        return point.getX() + "," + point.getY() + "," + point.getZ();
+    }
+
+    // CPM objects carry relative position from sender to perceived object.
+    private String formatRelativePosition(CartesianPoint senderPosition, CartesianPoint objectPosition) {
+        if (senderPosition == null || objectPosition == null) {
+            return "";
+        }
+        double relativeX = objectPosition.getX() - senderPosition.getX();
+        double relativeY = objectPosition.getY() - senderPosition.getY();
+        double relativeZ = objectPosition.getZ() - senderPosition.getZ();
+        return relativeX + "," + relativeY + "," + relativeZ;
     }
 
     @Override

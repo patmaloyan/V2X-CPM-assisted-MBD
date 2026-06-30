@@ -8,8 +8,8 @@
   "velocityChange": 0.5,
   "jsonPath" : "<your path>",
   "simulationTime": {
-    "start": 7200,
-    "end": 14400
+    "start": 0,
+    "end": 60
   },
   "simulationArea": {
     "minX": 48.749772,

@@ -1,3 +1,16 @@
 {
-
+  "perceptionConfiguration": {
+    "vehicleIndex": {
+      "enabled": true,
+      "type": "grid",
+      "cellWidth": "5m",
+      "cellHeight": "5m"
+    },
+    "trafficLightIndex": {
+      "enabled": false
+    },
+    "wallIndex": {
+      "enabled": false
+    }
+  }
 }
