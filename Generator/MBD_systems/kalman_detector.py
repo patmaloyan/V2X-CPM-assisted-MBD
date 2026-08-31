@@ -300,7 +300,7 @@ class CamOnlyKalmanDetector:
 
 
 class CamCpmKalmanDetector(CamOnlyKalmanDetector):
-    """Tsukada detector using one time-ordered CAM/CPM stream per receiver."""
+    """Kalman detector using one time-ordered CAM/CPM stream per receiver."""
 
     def __init__(self, catch_params=None, catch_enabled=True):
         super().__init__(catch_params, catch_enabled)

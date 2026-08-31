@@ -1,0 +1,44 @@
+{
+  "benign": {
+    "vehicles": 450,
+    "total_cases": 5615022,
+    "cases": {
+      "mutual": {
+        "count": 3455918,
+        "average_per_vehicle": 7679.817777777777,
+        "percentage": 61.54771967055517
+      },
+      "b_to_a_only": {
+        "count": 1351345,
+        "average_per_vehicle": 3002.988888888889,
+        "percentage": 24.066602054275123
+      },
+      "a_to_b_only": {
+        "count": 807759,
+        "average_per_vehicle": 1795.02,
+        "percentage": 14.385678275169715
+      }
+    }
+  },
+  "attacker": {
+    "vehicles": 112,
+    "total_cases": 945773,
+    "cases": {
+      "mutual": {
+        "count": 15118,
+        "average_per_vehicle": 134.98214285714286,
+        "percentage": 1.5984808193932372
+      },
+      "b_to_a_only": {
+        "count": 8716,
+        "average_per_vehicle": 77.82142857142857,
+        "percentage": 0.9215742043809667
+      },
+      "a_to_b_only": {
+        "count": 921939,
+        "average_per_vehicle": 8231.598214285714,
+        "percentage": 97.4799449762258
+      }
+    }
+  }
+}

@@ -1,72 +1,87 @@
 import argparse
 import json
-import sys
-import os
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, Any
 
 import pandas as pd
 
 from data_structures import Parameters
 from catch_profiles import load_catch_profile
-from cpm_enhanced_detector import process_two_edge_reciprocity_folder
+from cpm_detector import (
+    MIN_TRUST_UPDATES,
+    PrvDetector,
+    RECIPROCITY_NIS_THRESHOLD,
+    TwoEdgeReciprocityDetector,
+)
 from kalman_detector import (
-    evaluation_receiver_ids,
+    CamCpmKalmanDetector,
     process_cam_cpm_kalman_folder,
     process_kalman_folder,
 )
-from weighted_reciprocity_detector import (
-    process_maintained_trust_reciprocity_folder,
-    process_no_anonymous_maintained_trust_folder,
-    process_weighted_reciprocity_folder,
+
+
+BASE_KALMAN_METRICS = (
+    "wireless_range_m",
+    "range_margin_m",
+    "nis_threshold",
+    "known_alias_nis_threshold",
+    "max_kalman_prediction_gap_s",
+    "max_association_prediction_gap_s",
+    "process_noise_intensity",
+    "total_messages",
+    "evaluated_receivers",
+    "excluded_attacker_receivers",
 )
+CPM_KALMAN_METRICS = BASE_KALMAN_METRICS + (
+    "cpm_sensor_range_m",
+    "cam_messages",
+    "cpm_messages",
+)
+RECIPROCITY_METRICS = CPM_KALMAN_METRICS + ("reciprocity_nis_threshold",)
 
-
-def worker_process_json(input_file: str, option: int, params_dict: Dict[str, Any], source_file: str):
-    """Worker for JSON-File Processing"""
-    try:
-        import data_processing
-
-        input_path = Path(input_file)
-        params = Parameters(**params_dict)
-        result = data_processing.process(input_path, option, params, pd.DataFrame(), source_file)
-        return {'status': 'ok', 'metrics': result, 'source': source_file}
-    except Exception as e:
-        return {'status': 'error', 'error': str(e), 'source': source_file}
-
-
-def worker_process_catch_pair(cam_file, cpm_file, option, params_dict, source_file):
-    try:
-        import data_processing
-
-        params = Parameters(**params_dict)
-        df = data_processing.load_catch_messages(cam_file, cpm_file)
-        input_path = Path(cam_file or cpm_file)
-        result = data_processing.process(input_path, option, params, df, source_file)
-        return {'status': 'ok', 'metrics': result, 'source': source_file}
-    except Exception as e:
-        return {'status': 'error', 'error': str(e), 'source': source_file}
-
-
-def worker_process_parquet_group(parquet_file: str, option: int, params_dict: Dict[str, Any], source_file: str):
-    """Worker for Parquet-Group Processing"""
-    try:
-        import data_processing
-
-        parquet_path = Path(parquet_file)
-        params = Parameters(**params_dict)
-        df_all = pd.read_parquet(parquet_path)
-
-        if 'source_file' in df_all.columns:
-            group_df = df_all[df_all['source_file'] == source_file].copy()
-        else:
-            group_df = df_all
-
-        result = data_processing.process(parquet_path, option, params, group_df, source_file)
-        return {'status': 'ok', 'metrics': result, 'source': source_file}
-    except Exception as e:
-        return {'status': 'error', 'error': str(e), 'source': source_file}
+# A single table defines every Kalman-family CLI type. ``detector=None`` is the
+# CAM-only path; all other entries share the CAM+CPM folder processor.
+KALMAN_DETECTORS = {
+    2: {
+        "detector": None,
+        "result_name": "kalman_cam_only",
+        "metric_keys": BASE_KALMAN_METRICS,
+    },
+    3: {
+        "detector": CamCpmKalmanDetector,
+        "result_name": "kalman_cam_cpm",
+        "metric_keys": CPM_KALMAN_METRICS,
+    },
+    4: {
+        "detector": TwoEdgeReciprocityDetector,
+        "result_name": "kalman_cam_cpm_enhanced_two_edges",
+        "metric_keys": CPM_KALMAN_METRICS,
+    },
+    6: {
+        "detector": PrvDetector,
+        "result_name": "kalman_cam_cpm_prv",
+        "metric_keys": RECIPROCITY_METRICS + ("minimum_trust_updates",),
+        "extra_metrics": {
+            "reciprocity_nis_threshold": RECIPROCITY_NIS_THRESHOLD,
+            "minimum_trust_updates": MIN_TRUST_UPDATES,
+        },
+    },
+}
+CATCH_PARAMETER_FIELDS = {
+    "mpr": "MAX_PLAUSIBLE_RANGE",
+    "msar": "MAX_SA_RANGE",
+    "mpdn": "MAX_PLAUSIBLE_DIST_NEGATIVE",
+    "mps": "MAX_PLAUSIBLE_SPEED",
+    "mpa": "MAX_PLAUSIBLE_ACCEL",
+    "mpd": "MAX_PLAUSIBLE_DECEL",
+    "mhc": "MAX_HEADING_CHANGE",
+    "mdi": "MAX_DELTA_INTERSECTION",
+    "mtd": "MAX_TIME_DELTA",
+    "pht": "POS_HEADING_TIME",
+    "mmru": "MAX_MGT_RNG_UP",
+    "mmrd": "MAX_MGT_RNG_DOWN",
+    "msat": "MAX_SA_TIME",
+    "mnrs": "MAX_NON_ROUTE_SPEED",
+}
 
 
 def evaluate_predictions(scenario_stats):
@@ -118,14 +133,78 @@ def result_directory(input_folder: Path, detection_type: str):
     return output_dir
 
 
+def run_kalman_detector(
+    input_folder, detection_type, params, catch_enabled, catch_profile
+):
+    """Run one configured Kalman-family detector and prepare its CLI output."""
+    config = KALMAN_DETECTORS[detection_type]
+    detector = config["detector"]
+    if detector is None:
+        metrics, debug_results = process_kalman_folder(
+            input_folder, params, catch_enabled
+        )
+    else:
+        metrics, debug_results = process_cam_cpm_kalman_folder(
+            input_folder, params, detector, catch_enabled
+        )
+
+    metrics.update(config.get("extra_metrics", {}))
+    aggregated_metrics = evaluate_predictions([metrics])
+    for key in config["metric_keys"]:
+        aggregated_metrics[key] = metrics.get(key)
+    add_catch_output(aggregated_metrics, metrics, catch_profile, params)
+    return config, aggregated_metrics, debug_results
+
+
+def save_kalman_results(
+    input_folder, config, aggregated_metrics, debug_results, catch_enabled
+):
+    result_name = config["result_name"] + ("" if catch_enabled else "_no_catch")
+    output_dir = result_directory(input_folder, result_name)
+    output_file = output_dir / "predicted.json"
+    debug_file = output_dir / "debug.json"
+    with open(output_file, "w", encoding="utf-8") as file:
+        json.dump(aggregated_metrics, file, indent=4)
+    with open(debug_file, "w", encoding="utf-8") as file:
+        json.dump(
+            debug_results.where(pd.notnull(debug_results), None).to_dict(
+                orient="records"
+            ),
+            file,
+            indent=4,
+        )
+    print(f"Saved in {output_file}")
+    print(f"Saved debug in {debug_file}")
+
+
+def load_parameters(args):
+    if args.train == 1:
+        values = {
+            name: getattr(args, option)
+            for option, name in CATCH_PARAMETER_FIELDS.items()
+        }
+        return Parameters(**values)
+    if args.parameter:
+        with open(args.parameter, "r", encoding="utf-8") as file:
+            values = json.load(file)["parameters"]
+        return Parameters(**{
+            name: values[option]
+            for option, name in CATCH_PARAMETER_FIELDS.items()
+        })
+    return load_catch_profile(args.catch_profile)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_folder", help="Pfad zu den Eingabedateien", required=True)
     parser.add_argument(
         "--type",
         type=int,
-        choices=[*range(7), 20, 100],
-        help="0 = catch-checks, 1 = legacy checks, 2 = CAM-only Kalman, 3 = CAM+CPM Kalman, 4 = two-edge reciprocal CPM Kalman, 5 = three-score average reciprocity, 6 = PRV, 20 = maintained trust without anonymous CPM tracks, 100 = alias-aware catch",
+        choices=sorted(KALMAN_DETECTORS),
+        help=(
+            "2 = CAM-only Kalman, 3 = CAM+CPM Kalman, "
+            "4 = two-edge reciprocal CPM Kalman, 6 = PRV"
+        ),
         required=True,
     )
     parser.add_argument(
@@ -144,426 +223,26 @@ def main():
         help="Run Kalman detector types without the CaTCH gate",
     )
     parser.add_argument("--train", type=float)
-    parser.add_argument("--parameter", required=False,default=None)
-    parser.add_argument('--mpr', required=False, type=float)
-    parser.add_argument('--msar', required=False, type=float)
-    parser.add_argument('--mpdn', required=False, type=float)
-    parser.add_argument('--mps', required=False, type=float)
-    parser.add_argument('--mpa', required=False, type=float)
-    parser.add_argument('--mpd', required=False, type=float)
-    parser.add_argument('--mhc', required=False, type=float)
-    parser.add_argument('--mdi', required=False, type=float)
-    parser.add_argument('--mtd', required=False, type=float)
-    parser.add_argument('--pht', required=False, type=float)
-    parser.add_argument('--mmru', required=False, type=float)
-    parser.add_argument('--mmrd', required=False, type=float)
-    parser.add_argument('--msat', required=False, type=float)
-    parser.add_argument('--mnrs', required=False, type=float)
-    parser.add_argument('--workers', required=False, type=int, default=os.cpu_count() or 4,
-                        help="Number of parallel processes (default: CPU count)")
+    parser.add_argument("--parameter")
+    for option in CATCH_PARAMETER_FIELDS:
+        parser.add_argument(f"--{option}", type=float)
     args = parser.parse_args()
 
     input_folder = Path(args.input_folder)
-    scenario_stats = []
     catch_enabled = not args.no_catch
 
-    # Parameter Setup
-    if int(args.type) in (0, 2, 3, 4, 5, 6, 20, 100) and args.train != 1:
-        params = load_catch_profile(args.catch_profile)
-    elif args.train == 1:
-        params = Parameters(MAX_PLAUSIBLE_RANGE=args.mpr,
-                            MAX_SA_RANGE=args.msar,
-                            MAX_PLAUSIBLE_DIST_NEGATIVE=args.mpdn,
-                            MAX_PLAUSIBLE_SPEED=args.mps,
-                            MAX_PLAUSIBLE_ACCEL=args.mpa,
-                            MAX_PLAUSIBLE_DECEL=args.mpd,
-                            MAX_HEADING_CHANGE=args.mhc,
-                            MAX_DELTA_INTERSECTION=args.mdi,
-                            MAX_TIME_DELTA=args.mtd,
-                            POS_HEADING_TIME=args.pht,
-                            MAX_MGT_RNG_UP=args.mmru,
-                            MAX_MGT_RNG_DOWN=args.mmrd,
-                            MAX_SA_TIME=args.msat,
-                            MAX_NON_ROUTE_SPEED=args.mnrs)
-    elif args.parameter is not None:
-        with open(args.parameter, 'r') as f:
-            data = json.load(f)
-
-        p = data['parameters']
-
-        params = Parameters(
-            MAX_PLAUSIBLE_RANGE=p['mpr'],
-            MAX_SA_RANGE=args.msar,
-            MAX_PLAUSIBLE_DIST_NEGATIVE=p['mpdn'],
-            MAX_PLAUSIBLE_SPEED=p['mps'],
-            MAX_PLAUSIBLE_ACCEL=p['mpa'],
-            MAX_PLAUSIBLE_DECEL=p['mpd'],
-            MAX_HEADING_CHANGE=p['mhc'],
-            MAX_DELTA_INTERSECTION=p['mdi'],
-            MAX_TIME_DELTA=p['mtd'],
-            POS_HEADING_TIME=p['pht'],
-            MAX_MGT_RNG_UP=p['mmru'],
-            MAX_MGT_RNG_DOWN=p['mmrd'],
-            MAX_SA_TIME=args.msat,
-            MAX_NON_ROUTE_SPEED=p['mnrs']
-        )
-    else:
-        params = Parameters()
-
+    params = load_parameters(args)
     params.POSITION_PLAUSIBILITY_ENABLED = not args.no_pos_check
 
-    params_dict = vars(params)
-    count = 0
-    max_workers = args.workers
-    excluded_attacker_receivers = 0
-
-    # *** Added Section for Kalman procedure, each type of evalutation ***
-    if int(args.type) == 2:
-        metrics, debug_results = process_kalman_folder(
-            input_folder, params, catch_enabled
-        )
-        scenario_stats.append(metrics)
-        aggregated_metrics = evaluate_predictions(scenario_stats)
-        for key in [
-            "wireless_range_m", "range_margin_m", "nis_threshold",
-            "process_noise_intensity",
-            "known_alias_nis_threshold", "max_kalman_prediction_gap_s",
-            "max_association_prediction_gap_s",
-            "total_messages", "evaluated_receivers", "excluded_attacker_receivers",
-        ]:
-            aggregated_metrics[key] = metrics.get(key)
-        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
-        print(aggregated_metrics['f1'])
-
-        if args.train == 0:
-            result_name = "kalman_cam_only" + ("" if catch_enabled else "_no_catch")
-            output_dir = result_directory(input_folder, result_name)
-            output_file = output_dir / "predicted.json"
-            debug_file = output_dir / "debug.json"
-            print(f"Saved in {output_file}")
-            with open(output_file, 'w') as f:
-                json.dump(aggregated_metrics, f, indent=4)
-            # Kalman debug output: one compact row per CAM decision for FP/rejection analysis.
-            with open(debug_file, 'w') as f:
-                json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
-            print(f"Saved debug in {debug_file}")
-        return
-
-    if int(args.type) == 3:
-        # Type 3 adds the CPM perceived-object branch while preserving type 2 as CAM-only.
-        metrics, debug_results = process_cam_cpm_kalman_folder(
-            input_folder, params, catch_enabled=catch_enabled
-        )
-        scenario_stats.append(metrics)
-        aggregated_metrics = evaluate_predictions(scenario_stats)
-        for key in [
-            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold",
-            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
-            "process_noise_intensity",
-            "total_messages", "cam_messages", "cpm_messages",
-            "evaluated_receivers", "excluded_attacker_receivers",
-        ]:
-            aggregated_metrics[key] = metrics.get(key)
-        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
-        print(aggregated_metrics['f1'])
-
-        if args.train == 0:
-            result_name = "kalman_cam_cpm" + ("" if catch_enabled else "_no_catch")
-            output_dir = result_directory(input_folder, result_name)
-            output_file = output_dir / "predicted.json"
-            debug_file = output_dir / "debug.json"
-            print(f"Saved in {output_file}")
-            with open(output_file, 'w') as f:
-                json.dump(aggregated_metrics, f, indent=4)
-            with open(debug_file, 'w') as f:
-                json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
-            print(f"Saved debug in {debug_file}")
-        return
-
-    if int(args.type) == 4:
-        metrics, debug_results = process_two_edge_reciprocity_folder(
-            input_folder, params, catch_enabled,
-        )
-        scenario_stats.append(metrics)
-        aggregated_metrics = evaluate_predictions(scenario_stats)
-        for key in [
-            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold",
-            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
-            "process_noise_intensity",
-            "total_messages", "cam_messages", "cpm_messages",
-            "evaluated_receivers", "excluded_attacker_receivers",
-        ]:
-            aggregated_metrics[key] = metrics.get(key)
-        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
-        print(aggregated_metrics['f1'])
-
-        if args.train == 0:
-            result_name = "kalman_cam_cpm_enhanced_two_edges" + ("" if catch_enabled else "_no_catch")
-            output_dir = result_directory(input_folder, result_name)
-            output_file = output_dir / "predicted.json"
-            debug_file = output_dir / "debug.json"
-            print(f"Saved in {output_file}")
-            with open(output_file, 'w') as f:
-                json.dump(aggregated_metrics, f, indent=4)
-            with open(debug_file, 'w') as f:
-                json.dump(debug_results.where(pd.notnull(debug_results), None).to_dict(orient='records'), f, indent=4)
-            print(f"Saved debug in {debug_file}")
-        return
-
-    if int(args.type) == 5:
-        metrics, debug_results = process_weighted_reciprocity_folder(
-            input_folder, params, catch_enabled
-        )
-        scenario_stats.append(metrics)
-        aggregated_metrics = evaluate_predictions(scenario_stats)
-        for key in [
-            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold",
-            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
-            "reciprocity_nis_threshold",
-            "process_noise_intensity",
-            "total_messages", "cam_messages", "cpm_messages",
-            "evaluated_receivers", "excluded_attacker_receivers",
-        ]:
-            aggregated_metrics[key] = metrics.get(key)
-        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
-        print(aggregated_metrics['f1'])
-
-        if args.train == 0:
-            result_name = "kalman_cam_cpm_averaged_reciprocity" + (
-                "" if catch_enabled else "_no_catch"
-            )
-            output_dir = result_directory(input_folder, result_name)
-            output_file = output_dir / "predicted.json"
-            debug_file = output_dir / "debug.json"
-            print(f"Saved in {output_file}")
-            with open(output_file, 'w') as f:
-                json.dump(aggregated_metrics, f, indent=4)
-            with open(debug_file, 'w') as f:
-                json.dump(
-                    debug_results.where(pd.notnull(debug_results), None)
-                    .to_dict(orient='records'),
-                    f,
-                    indent=4,
-                )
-            print(f"Saved debug in {debug_file}")
-        return
-
-    if int(args.type) == 6:
-        metrics, debug_results = process_maintained_trust_reciprocity_folder(
-            input_folder, params, catch_enabled
-        )
-        scenario_stats.append(metrics)
-        aggregated_metrics = evaluate_predictions(scenario_stats)
-        for key in [
-            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold",
-            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
-            "reciprocity_nis_threshold",
-            "minimum_trust_updates",
-            "process_noise_intensity",
-            "total_messages", "cam_messages", "cpm_messages",
-            "evaluated_receivers", "excluded_attacker_receivers",
-        ]:
-            aggregated_metrics[key] = metrics.get(key)
-        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
-        print(aggregated_metrics['f1'])
-
-        if args.train == 0:
-            result_name = "kalman_cam_cpm_prv" + (
-                "" if catch_enabled else "_no_catch"
-            )
-            output_dir = result_directory(input_folder, result_name)
-            output_file = output_dir / "predicted.json"
-            debug_file = output_dir / "debug.json"
-            print(f"Saved in {output_file}")
-            with open(output_file, 'w') as f:
-                json.dump(aggregated_metrics, f, indent=4)
-            with open(debug_file, 'w') as f:
-                json.dump(
-                    debug_results.where(pd.notnull(debug_results), None)
-                    .to_dict(orient='records'),
-                    f,
-                    indent=4,
-                )
-            print(f"Saved debug in {debug_file}")
-        return
-
-    if int(args.type) == 20:
-        metrics, debug_results = process_no_anonymous_maintained_trust_folder(
-            input_folder, params, catch_enabled
-        )
-        scenario_stats.append(metrics)
-        aggregated_metrics = evaluate_predictions(scenario_stats)
-        for key in [
-            "wireless_range_m", "range_margin_m", "cpm_sensor_range_m",
-            "nis_threshold", "known_alias_nis_threshold",
-            "max_kalman_prediction_gap_s", "max_association_prediction_gap_s",
-            "reciprocity_nis_threshold",
-            "process_noise_intensity",
-            "total_messages", "cam_messages", "cpm_messages",
-            "evaluated_receivers", "excluded_attacker_receivers",
-        ]:
-            aggregated_metrics[key] = metrics.get(key)
-        add_catch_output(aggregated_metrics, metrics, args.catch_profile, params)
-        print(aggregated_metrics['f1'])
-
-        if args.train == 0:
-            result_name = "kalman_cam_cpm_maintained_trust_no_anonymous" + (
-                "" if catch_enabled else "_no_catch"
-            )
-            output_dir = result_directory(input_folder, result_name)
-            output_file = output_dir / "predicted.json"
-            debug_file = output_dir / "debug.json"
-            print(f"Saved in {output_file}")
-            with open(output_file, 'w') as f:
-                json.dump(aggregated_metrics, f, indent=4)
-            with open(debug_file, 'w') as f:
-                json.dump(
-                    debug_results.where(pd.notnull(debug_results), None)
-                    .to_dict(orient='records'),
-                    f,
-                    indent=4,
-                )
-            print(f"Saved debug in {debug_file}")
-        return
-
-    print(f"Starting processing with {max_workers} workers...", file=sys.stderr)
-
-    nested_catch = (
-        int(args.type) in (0, 100)
-        and (input_folder / "cam").is_dir()
-        and (input_folder / "cpm").is_dir()
+    detection_type = int(args.type)
+    config, aggregated_metrics, debug_results = run_kalman_detector(
+        input_folder, detection_type, params, catch_enabled, args.catch_profile
     )
-    data_folder = input_folder
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
-        if nested_catch:
-            cam_files = {path.stem: path for path in (input_folder / "cam").glob("*.json")}
-            cpm_files = {path.stem: path for path in (input_folder / "cpm").glob("*.json")}
-            all_receiver_ids = sorted(set(cam_files) | set(cpm_files))
-            receiver_ids = evaluation_receiver_ids(input_folder, all_receiver_ids)
-            excluded_attacker_receivers = len(all_receiver_ids) - len(receiver_ids)
-            total_files = len(receiver_ids)
-            for receiver_id in receiver_ids:
-                f = executor.submit(
-                    worker_process_catch_pair,
-                    str(cam_files[receiver_id]) if receiver_id in cam_files else None,
-                    str(cpm_files[receiver_id]) if receiver_id in cpm_files else None,
-                    int(args.type), params_dict, receiver_id,
-                )
-                futures[f] = receiver_id
-
-        parquet_files = list(data_folder.glob('*.parquet'))
-
-        if nested_catch:
-            pass
-        elif parquet_files:
-            # Parquet Verarbeitung
-            parquet_file = parquet_files[0]
-            df_all = pd.read_parquet(parquet_file)
-
-            if 'source_file' in df_all.columns:
-                grouped = df_all.groupby('source_file')
-                total_files = len(grouped)
-                for vehicle_id, _ in grouped:
-                    f = executor.submit(worker_process_parquet_group, str(parquet_file),
-                                        int(args.type), params_dict, vehicle_id)
-                    futures[f] = vehicle_id
-            else:
-                total_files = 1
-                source_name = parquet_file.stem
-                f = executor.submit(worker_process_parquet_group, str(parquet_file),
-                                    int(args.type), params_dict, source_name)
-                futures[f] = source_name
-        else:
-            # JSON Verarbeitung
-            json_files = [f for f in data_folder.glob('*.json')
-                          if "ground_truth" not in f.name.lower()]
-            total_files = len(json_files)
-
-            for json_file in json_files:
-                source_name = json_file.stem
-                f = executor.submit(worker_process_json, str(json_file),
-                                    int(args.type), params_dict, source_name)
-                futures[f] = source_name
-
-        if total_files == 0:
-            raise ValueError(f"No input files found in {data_folder}")
-
-        # Ergebnisse sammeln
-        for future in as_completed(futures):
-            source = futures[future]
-            try:
-                res = future.result()
-                if res.get('status') == 'ok':
-                    scenario_stats.append(res.get('metrics', {}))
-                    count += 1
-                    print(f"Processed prediction for file {count}/{total_files}: {source}", file=sys.stderr)
-                else:
-                    count += 1
-                    print(f"[ERROR] {source}: {res.get('error')}", file=sys.stderr)
-            except Exception as e:
-                count += 1
-                print(f"[ERROR] processing {source}: {e}", file=sys.stderr)
-
-    # Auswertung
-    aggregated_metrics = evaluate_predictions(scenario_stats)
-    print(aggregated_metrics['f1'])
-
+    print(aggregated_metrics["f1"])
     if args.train == 0:
-        detection_type = {
-            0: "catch",
-            100: "catch_alias",
-        }.get(int(args.type), "legacy")
-        if int(args.type) in (0, 100):
-            aggregated_metrics["catch_profile"] = args.catch_profile
-            aggregated_metrics["identity"] = (
-                "sender_id" if int(args.type) == 0 else "sender_alias"
-            )
-            aggregated_metrics["alias_grace_messages"] = sum(
-                result.get("alias_grace_messages", 0) for result in scenario_stats
-            )
-            aggregated_metrics["total_messages"] = sum(
-                result.get("total_messages", 0) for result in scenario_stats
-            )
-            aggregated_metrics["cam_messages"] = sum(
-                result.get("cam_messages", 0) for result in scenario_stats
-            )
-            aggregated_metrics["cpm_messages"] = sum(
-                result.get("cpm_messages", 0) for result in scenario_stats
-            )
-            activation_names = {
-                name
-                for result in scenario_stats
-                for name in result.get("check_activations", {})
-            }
-            aggregated_metrics["check_activations"] = {
-                name: sum(
-                    result.get("check_activations", {}).get(name, 0)
-                    for result in scenario_stats
-                )
-                for name in sorted(activation_names)
-            }
-            aggregated_metrics["parameters"] = params_dict
-            aggregated_metrics["position_plausibility_check_enabled"] = (
-                params.POSITION_PLAUSIBILITY_ENABLED
-            )
-            aggregated_metrics["evaluated_receivers"] = total_files
-            aggregated_metrics["excluded_attacker_receivers"] = excluded_attacker_receivers
-        output_dir = result_directory(input_folder, detection_type)
-        output_file = output_dir / "predicted.json"
-        print(f"Saved in {output_file}")
-        with open(output_file, 'w') as f:
-            json.dump(aggregated_metrics, f, indent=4)
-        if int(args.type) in (0, 100):
-            debug_file = output_dir / "debug.json"
-            with open(debug_file, 'w') as f:
-                json.dump(scenario_stats, f, indent=4)
-
+        save_kalman_results(
+            input_folder, config, aggregated_metrics, debug_results, catch_enabled
+        )
 
 if __name__ == "__main__":
     main()

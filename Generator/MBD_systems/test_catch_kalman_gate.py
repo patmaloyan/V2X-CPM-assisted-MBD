@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
-from cpm_enhanced_detector import TwoEdgeReciprocityDetector
+from cpm_detector import TwoEdgeReciprocityDetector
 from data_structures import Parameters
 from kalman_detector import (
     KNOWN_ALIAS_NIS_THRESHOLD,

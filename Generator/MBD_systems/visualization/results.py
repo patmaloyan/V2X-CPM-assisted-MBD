@@ -16,13 +16,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 MAIN_SCRIPT = REPO_ROOT / "Generator" / "MBD_systems" / "main.py"
 
 DETECTORS = {
-    100: ("CaTCH", "catch_alias"),
     2: ("CAM Only", "kalman_cam_only"),
-    3: ("Tsukada", "kalman_cam_cpm"),
-    4: ("2-Edge Recip.", "kalman_cam_cpm_enhanced_two_edges"),
-    5: ("Avg. Weighted Recip.", "kalman_cam_cpm_averaged_reciprocity"),
+    3: ("Kalman", "kalman_cam_cpm"),
     6: ("PRV", "kalman_cam_cpm_prv"),
-    20: ("Trust Recip. (No Anon.)", "kalman_cam_cpm_maintained_trust_no_anonymous"),
 }
 
 ATTACK_LABELS = {
@@ -46,7 +42,10 @@ def parse_args():
         type=Path,
         help="Explicit Simulation-Test folder (overrides the folder derived from --setting)",
     )
-    parser.add_argument("--types", nargs="+", type=int, default=[2, 3, 4, 6], help="Detector types (2-6, 20, 100)")
+    parser.add_argument(
+        "--types", nargs="+", type=int, default=[2, 3, 6],
+        help="Plotted detector types (2, 3, or 6)",
+    )
     parser.add_argument(
         "--attacks",
         nargs="+",
@@ -79,7 +78,7 @@ def parse_args():
 def validate_args(args):
     unsupported = [detector_type for detector_type in args.types if detector_type not in DETECTORS]
     if unsupported:
-        raise ValueError(f"Unsupported detector types: {unsupported}; choose from 2-6, 20, or 100")
+        raise ValueError(f"Unsupported detector types: {unsupported}; choose from 2, 3, or 6")
     if len(set(args.types)) != len(args.types):
         raise ValueError("Detector types must not contain duplicates")
     if len(set(args.attacks)) != len(args.attacks):
@@ -111,7 +110,7 @@ def run_detector(input_folder, detector_type, no_pos_check=False, no_catch=False
 
 def load_metrics(setting_root, input_folder, detector_type, no_catch=False):
     _, result_folder = DETECTORS[detector_type]
-    if no_catch and detector_type != 100:
+    if no_catch:
         result_folder += "_no_catch"
     metrics_path = setting_root / "results" / input_folder.name / result_folder / "predicted.json"
     if not metrics_path.is_file():

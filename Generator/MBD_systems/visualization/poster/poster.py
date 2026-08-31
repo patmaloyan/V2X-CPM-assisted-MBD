@@ -23,7 +23,7 @@ SVG_PATH = OUTPUT_PATH.with_suffix(".svg")
 
 DETECTORS = [
     (2, "CAM Only"),
-    (3, "Tsukada [1]"),
+    (3, "Kalman [1]"),
     (6, "PRV"),
 ]
 ATTACKS = [
@@ -140,7 +140,7 @@ def main():
     )
     captions = [
         ("CAM Only:", "Identify implausible trajectories of attackers"),
-        ("Tsukada:", "Previous literature uses CPM to decrease FPs"),
+        ("Kalman:", "Previous literature uses CPM to decrease FPs"),
         ("PRV:", "Proposed framework to detect plausible trajectories"),
     ]
     for y, (label, description) in zip((0.112, 0.072, 0.032), captions):

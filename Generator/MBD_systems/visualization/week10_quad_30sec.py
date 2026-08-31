@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Slice Week-10 attacks, run the paper detectors, and make 2x2 figures.
 
-The selected interval is 120--150 seconds after each communication window
-starts.  This avoids the startup transient while retaining an identical,
-predeclared 30-second relative window in all four traffic settings.
+Evaluation begins at each communication-window boundary. Three settings use
+30 seconds; sparse Highway 2 AM uses its complete 300-second window.
 """
 
 from __future__ import annotations
@@ -28,16 +27,16 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WEEK10_ROOT = REPO_ROOT / "Simulations-week10"
 ATTACK_ROOT = WEEK10_ROOT / "attacks"
-WORK_ROOT = WEEK10_ROOT / ".work" / "visualization-30sec"
+WORK_ROOT = WEEK10_ROOT / ".work" / "visualization-corrected"
 OUTPUT_ROOT = Path(__file__).resolve().parent / "created"
 MAIN_SCRIPT = REPO_ROOT / "Generator" / "MBD_systems" / "main.py"
 PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
 
 SETTINGS = (
-    ("InTAS_urban_2AM_300sec", "Urban", "2 AM", 7_320, "urban-low"),
-    ("InTAS_urban_7AM_300sec", "Urban", "7 AM", 25_320, "urban-low"),
-    ("InTAS_highway_2AM_300sec", "Highway", "2 AM", 7_320, "highway-low"),
-    ("InTAS_highway_7AM_300sec", "Highway", "7 AM", 25_320, "highway-low"),
+    ("InTAS_urban_2AM_300sec", "Urban", "2 AM", 7_200, 30, "urban-low"),
+    ("InTAS_urban_7AM_300sec", "Urban", "7 AM", 25_200, 30, "urban-low"),
+    ("InTAS_highway_2AM_300sec", "Highway", "2 AM", 7_200, 300, "urban-low"),
+    ("InTAS_highway_7AM_300sec", "Highway", "7 AM", 25_200, 30, "urban-low"),
 )
 ATTACKS = (
     ("randomPositionOffset", "Random Position Offset", "#4C78A8"),
@@ -45,11 +44,10 @@ ATTACKS = (
 )
 DETECTORS = (
     (2, "CAM Only", "kalman_cam_only_no_catch"),
-    (3, "Tsukada", "kalman_cam_cpm_no_catch"),
+    (3, "Kalman", "kalman_cam_cpm_no_catch"),
     (6, "PRV", "kalman_cam_cpm_prv_no_catch"),
 )
 ATTACK_SEEDS = (1, 2, 3)
-WINDOW_LENGTH_S = 30
 
 
 def parse_args() -> argparse.Namespace:
@@ -154,9 +152,9 @@ def prepare(force: bool, workers: int) -> None:
     jobs: list[tuple[str, str, int, int]] = []
     dataset_info: dict[str, dict] = {}
 
-    for setting, area, time_label, start_s, _profile in SETTINGS:
+    for setting, area, time_label, start_s, duration_s, _profile in SETTINGS:
         start_ns = start_s * 1_000_000_000
-        end_ns = (start_s + WINDOW_LENGTH_S) * 1_000_000_000
+        end_ns = (start_s + duration_s) * 1_000_000_000
         for attack, _label, _color in ATTACKS:
             for seed in ATTACK_SEEDS:
                 source = source_root(setting, attack, seed)
@@ -179,7 +177,8 @@ def prepare(force: bool, workers: int) -> None:
                     "attack_seed": seed,
                     "simulation_seed": 1,
                     "window_start_s": start_s,
-                    "window_end_s": start_s + WINDOW_LENGTH_S,
+                    "window_end_s": start_s + duration_s,
+                    "window_duration_s": duration_s,
                     "window_semantics": "start-inclusive, end-exclusive receive time; ego falls back to send time",
                     "source": str(source.relative_to(REPO_ROOT)),
                     "files": {},
@@ -259,7 +258,7 @@ def run_detectors(
     if jobs < 1:
         raise ValueError("--detector-jobs must be at least 1")
     work = []
-    for setting, _area, _time_label, _start_s, profile in SETTINGS:
+    for setting, _area, _time_label, _start_s, _duration_s, profile in SETTINGS:
         if areas and _area.lower() not in areas:
             continue
         for attack, _label, _color in ATTACKS:
@@ -292,18 +291,19 @@ def rates(counts: dict[str, int]) -> dict[str, float]:
 
 def collect_metrics() -> dict:
     report: dict = {
-        "description": "Week-10 30-second detector comparison; attack seeds are micro-aggregated",
+        "description": "Week-10 detector comparison; attack seeds are micro-aggregated",
         "simulation_seed": 1,
         "attack_seeds": list(ATTACK_SEEDS),
         "detectors": {str(number): label for number, label, _folder in DETECTORS},
         "settings": {},
     }
-    for setting, area, time_label, start_s, profile in SETTINGS:
+    for setting, area, time_label, start_s, duration_s, profile in SETTINGS:
         setting_report = {
             "area": area,
             "time_label": time_label,
             "window_start_s": start_s,
-            "window_end_s": start_s + WINDOW_LENGTH_S,
+            "window_end_s": start_s + duration_s,
+            "window_duration_s": duration_s,
             "catch_profile": profile,
             "attacks": {},
         }
@@ -347,7 +347,7 @@ def plot_metric(report: dict, metric: str, heading: str, filename: str) -> None:
     bar_width = 0.36
     all_values = []
 
-    for axis, (setting, area, time_label, _start_s, _profile) in zip(axes.flat, SETTINGS):
+    for axis, (setting, area, time_label, _start_s, duration_s, _profile) in zip(axes.flat, SETTINGS):
         for attack_index, (attack, attack_label, color) in enumerate(ATTACKS):
             values = [
                 report["settings"][setting]["attacks"][attack]["detectors"][str(detector_type)]
@@ -361,7 +361,7 @@ def plot_metric(report: dict, metric: str, heading: str, filename: str) -> None:
             )
             add_value_labels(axis, bars)
 
-        axis.set_title(f"{area} — {time_label}", fontsize=13, weight="bold")
+        axis.set_title(f"{area} — {time_label} ({duration_s} s)", fontsize=13, weight="bold")
         axis.set_ylabel("Rate (%)")
         axis.set_xticks(x_positions, [label for _number, label, _folder in DETECTORS], rotation=15, ha="right")
         axis.grid(axis="y", alpha=0.25, linewidth=0.8)
@@ -377,34 +377,35 @@ def plot_metric(report: dict, metric: str, heading: str, filename: str) -> None:
         axis.set_ylim(0, upper)
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
-    figure.suptitle(f"Week-10 {heading} — 30-Second Window", fontsize=16, weight="bold", y=0.985)
+    figure.suptitle(f"Week-10 {heading}", fontsize=16, weight="bold", y=0.985)
     figure.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.945), ncol=2, frameon=False)
     figure.text(
         0.5, 0.015,
-        "Attack seeds 1–3 pooled • Simulation seed 1 • No CaTCH gate • 120 s warm-up",
+        "Attack seeds 1–3 pooled • Simulation seed 1 • No CaTCH gate",
         ha="center", fontsize=9, color="#444444",
     )
     figure.tight_layout(rect=(0, 0.04, 1, 0.90))
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    png_path = OUTPUT_ROOT / filename
-    svg_path = png_path.with_suffix(".svg")
-    figure.savefig(png_path, dpi=200, bbox_inches="tight", facecolor="white")
-    figure.savefig(svg_path, bbox_inches="tight", facecolor="white")
+    output_path = OUTPUT_ROOT / filename
+    save_options = {"bbox_inches": "tight", "facecolor": "white"}
+    if output_path.suffix.lower() == ".png":
+        save_options["dpi"] = 200
+    figure.savefig(output_path, **save_options)
     plt.close(figure)
-    print(f"Saved {png_path.relative_to(REPO_ROOT)}")
-    print(f"Saved {svg_path.relative_to(REPO_ROOT)}")
+    print(f"Saved {output_path.relative_to(REPO_ROOT)}")
 
 
 def plot() -> None:
     report = collect_metrics()
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    report_path = OUTPUT_ROOT / "week10_quad_30sec_metrics.json"
+    report_path = WORK_ROOT / "week10_quad_metrics.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = report_path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, report_path)
-    plot_metric(report, "false_positive_rate", "False Positive Rate", "week10_false_positive_rate_quad_30sec.png")
-    plot_metric(report, "true_positive_rate", "True Positive Rate", "week10_true_positive_rate_quad_30sec.png")
-    plot_metric(report, "f1_score", "F1 Score", "week10_f1_score_quad_30sec.png")
+    plot_metric(report, "false_positive_rate", "False Positive Rate", "week10_false_positive_rate_quad.png")
+    plot_metric(report, "true_positive_rate", "True Positive Rate", "week10_true_positive_rate_quad.png")
+    plot_metric(report, "f1_score", "F1 Score", "week10_f1_score_quad.png")
     print(f"Saved {report_path.relative_to(REPO_ROOT)}")
 
 
